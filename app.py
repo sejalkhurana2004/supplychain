@@ -57,17 +57,40 @@ OPEN_PO_MATCH_CAVEAT = (
 
 FX_TO_INR = {"INR": 1.0, "USD": 95.6, "EUR": 110.3, "GBP": 129.4}  # update before reuse
 
+# ---------------------------------------------------------------------------
+# Demo supply-team ownership
+# Every SKU is assigned to a supply team BEFORE SEA/AIR routing.
+# This is a demo mapping and can later be replaced with real ownership data.
+# ---------------------------------------------------------------------------
+
+SUPPLY_TEAMS = {
+    "Supply Team A": "supply.team.a@example.com",
+    "Supply Team B": "supply.team.b@example.com",
+    "Supply Team C": "supply.team.c@example.com",
+    "Supply Team D": "supply.team.d@example.com",
+    "Supply Team E": "supply.team.e@example.com",
+}
+
+MANAGEMENT_EMAIL = "management@example.com"
+
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 class RunResponse(BaseModel):
     run_timestamp: str
+
     kpis: dict[str, Any]
+
     top_procurement_actions: list[dict[str, Any]]
+
     top_working_capital: list[dict[str, Any]]
+
     gemini_summary: dict[str, Any]
-    email_subject: str
-    email_body: str
+
+    health_onepager: dict[str, Any]
+
+    stakeholder_emails: list[dict[str, Any]]
+
     open_po_caveat: str
 
 
@@ -137,8 +160,34 @@ def load_data() -> dict[str, pd.DataFrame]:
 # currency-normalization fix applied to Open PO Value.
 # ---------------------------------------------------------------------------
 
+def assign_supply_teams(stock_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Demo-only ownership mapping.
+
+    Every SKU is assigned to one Supply Team before any SEA/AIR
+    routing happens. The random seed makes the demo assignment
+    reproducible between runs.
+    """
+    stock_df = stock_df.copy()
+
+    teams = list(SUPPLY_TEAMS.keys())
+
+    rng = np.random.default_rng(42)
+
+    stock_df["Supply Team"] = rng.choice(
+        teams,
+        size=len(stock_df)
+    )
+
+    stock_df["Supply Team Email"] = stock_df["Supply Team"].map(SUPPLY_TEAMS)
+
+    return stock_df
+
 def build_master(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
     stock = data["stock"].copy()
+
+    # Assign ownership BEFORE any SEA/AIR routing.
+    stock = assign_supply_teams(stock)
     policy = data["policy"]
     pm = data["proc_master"]
     open_po_df = data["open_po"].copy()
@@ -160,8 +209,21 @@ def build_master(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
     )
 
     master = (
-        stock[["SAP code", "SKU Type", "Price_Unit", "Current Inventory"]]
-        .merge(policy[["SAP code", "Avg Consumption", "Min", "ROL", "MAX"]], on="SAP code", how="left")
+    stock[
+        [
+            "SAP code",
+            "SKU Type",
+            "Price_Unit",
+            "Current Inventory",
+            "Supply Team",
+            "Supply Team Email",
+        ]
+    ]
+    .merge(
+        policy[["SAP code", "Avg Consumption", "Min", "ROL", "MAX"]],
+        on="SAP code",
+        how="left",
+    )
         .merge(pm[["SAP code", "LT in months", "Total In transit"]], on="SAP code", how="left")
         .merge(po_agg, left_on="SAP code", right_on="Material Code", how="left")
         .drop(columns=["Material Code"], errors="ignore")
@@ -227,9 +289,21 @@ def build_procurement_actions(master: pd.DataFrame) -> pd.DataFrame:
         default="Review",
     )
     return actions[
-        ["Priority", "SAP code", "SKU Type", "Coverage_months", "Current Inventory",
-         "Open_Qty", "Recommended Order Qty", "LT in months", "Transport Mode", "Risk Reason"]
+    [
+        "Priority",
+        "SAP code",
+        "SKU Type",
+        "Coverage_months",
+        "Current Inventory",
+        "Open_Qty",
+        "Recommended Order Qty",
+        "LT in months",
+        "Transport Mode",
+        "Risk Reason",
+        "Supply Team",
+        "Supply Team Email",
     ]
+]
 
 
 def build_working_capital(master: pd.DataFrame) -> pd.DataFrame:
@@ -299,25 +373,228 @@ Working capital cases:
     return gemini_json(prompt)
 
 
-def build_email_draft(summary: dict[str, Any], actions: pd.DataFrame) -> dict[str, str]:
-    acts = actions.head(10).replace({np.nan: None}).to_dict(orient="records")
-    prompt = f"""
-You are drafting an internal email to the Procurement team.
+def build_health_onepager(kpis: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
+    """
+    Output 1 -- the Inventory Health One-Pager.
 
-Use ONLY the supplied facts below. Do not invent numbers, suppliers, costs, or
-commitments not present in the data.
+    Reuses the already-computed KPIs and the existing Gemini summary rather
+    than pulling in new numbers -- this only asks Gemini to write the
+    management-facing narrative around facts that are already trusted.
+
+    This is the daily business-review output for the top stakeholder
+    (supply chain / top management) -- separate from the SEA/AIR
+    procurement emails, which go to Supply Teams and the CFO.
+    """
+    prompt = f"""
+You are writing a one-page inventory health summary for senior management.
+
+Use ONLY the supplied facts. Do not invent numbers, costs, or suppliers.
 
 Return JSON with exactly these keys:
-subject: a short, specific subject line
-body: the full email body as plain text, with a greeting and a sign-off
-      placeholder like "[Your name]" -- do not sign it as Gemini or an AI.
+headline: one sentence capturing the single biggest finding
+major_issues: a list of 3-5 short bullet points on the biggest problems
+key_recommendations: a list of 3-5 short, concrete recommended actions
+management_summary: a 3-4 sentence plain-English summary for someone who
+   will only read this one page
+subject: a short email subject line for this report (e.g. "Daily Inventory
+   Health Summary")
 
-Management summary: {json.dumps(summary, default=str)}
-Top procurement actions: {json.dumps(acts, default=str)}
+KPIs: {json.dumps(kpis, default=str)}
+Existing analysis: {json.dumps(summary, default=str)}
 """
-    return gemini_json(prompt)
+    onepager = gemini_json(prompt)
+    onepager["kpis"] = kpis
+    onepager["recipient_email"] = MANAGEMENT_EMAIL
+    return onepager
 
 
+def generate_stakeholder_email(
+    recipient_name: str,
+    recipient_email: str,
+    cases: pd.DataFrame,
+    stakeholder_type: str,
+) -> dict:
+    """
+    Generate a stakeholder-specific procurement email using Gemini.
+
+    Python determines:
+      - which SKUs need action
+      - SEA vs AIR
+      - which Supply Team owns each SEA case
+      - that AIR cases go to CFO
+
+    Gemini only turns those decisions into a professional email.
+    """
+
+    if cases.empty:
+        return {
+            "recipient_name": recipient_name,
+            "recipient_email": recipient_email,
+            "stakeholder_type": stakeholder_type,
+            "subject": "",
+            "body": "",
+        }
+
+    # Format the data before sending it to Gemini so we never get
+    # long floating-point values such as 252.33333333333007.
+    case_lines = []
+
+    for _, row in cases.iterrows():
+        sap_code = str(row["SAP code"])
+        current_inventory = f"{float(row['Current Inventory']):,.2f}"
+        coverage = f"{float(row['Coverage_months']):.2f}"
+        order_qty = f"{float(row['Recommended Order Qty']):,.2f}"
+        risk = str(row["Risk Reason"])
+
+        case_lines.append(
+            f"- SAP Code: {sap_code} | "
+            f"Current Inventory: {current_inventory} | "
+            f"Coverage: {coverage} months | "
+            f"Recommended Order Qty: {order_qty} | "
+            f"Risk: {risk}"
+        )
+
+    cases_text = "\n".join(case_lines)
+
+    if stakeholder_type == "CFO":
+        instruction = """
+You are writing a concise approval email to the CFO.
+
+These are AIR procurement cases identified because of inventory risk.
+The CFO's action is to review and approve the expedited procurement.
+
+The email must:
+- Clearly request approval for the AIR procurement.
+- Briefly explain that expedited AIR procurement is required because of inventory risk.
+- Include every SAP code and recommended order quantity provided.
+- Group the information clearly and make critical cases easy to identify.
+- NOT mention any Supply Team.
+- NOT mention SEA procurement.
+- NOT invent costs, savings, dates, vendors, or other information.
+- Sound like a real internal business email, not an AI-generated report.
+"""
+
+    else:
+        instruction = """
+You are writing a concise procurement request email to the specific
+Supply Team receiving this email.
+
+The cases provided belong ONLY to this recipient's team.
+
+The email must:
+- Ask the team to initiate procurement for these cases.
+- Clearly indicate that prompt action is required.
+- Include every SAP code and recommended order quantity provided.
+- Clearly identify critical stock-out cases.
+- Keep the wording concise and practical.
+- NOT mention any other Supply Team.
+- NOT mention AIR procurement.
+- NOT invent costs, savings, dates, vendors, or other information.
+- Sound like a real internal business email, not an AI-generated report.
+"""
+
+    prompt = f"""
+{instruction}
+
+Recipient: {recipient_name}
+
+Procurement cases:
+
+{cases_text}
+
+Write the email with this structure:
+
+Greeting
+
+One short paragraph explaining the request.
+
+A clean list of the procurement cases. For each case, show:
+- SAP Code
+- Recommended Order Qty
+- Risk Reason
+
+A short closing asking the recipient to proceed and confirm once processed.
+
+Use exactly this signature:
+
+Thanks,
+Planning Team
+
+Keep the email professional, warm, concise, and easy to scan.
+
+Return ONLY valid JSON in this exact format:
+
+{{
+  "subject": "...",
+  "body": "..."
+}}
+"""
+
+    # Use the configured Gemini client/model.
+    email = gemini_json(prompt)
+
+    return {
+        "recipient_name": recipient_name,
+        "recipient_email": recipient_email,
+        "stakeholder_type": stakeholder_type,
+        "subject": email["subject"],
+        "body": email["body"],
+    }
+
+
+def build_stakeholder_emails(actions: pd.DataFrame) -> list[dict]:
+    """
+    Route procurement actions to the correct stakeholders.
+
+    SEA:
+        Group by Supply Team and generate one email per team.
+
+    AIR:
+        Combine all AIR cases and generate one CFO approval email.
+    """
+
+    emails = []
+
+    # -----------------------------
+    # SEA → Supply Teams
+    # -----------------------------
+
+    sea_cases = actions[
+        actions["Transport Mode"].astype(str).str.upper() == "SEA"
+    ].copy()
+
+    if not sea_cases.empty:
+        for team_name, team_cases in sea_cases.groupby("Supply Team"):
+            recipient_email = team_cases["Supply Team Email"].iloc[0]
+
+            email = generate_stakeholder_email(
+                recipient_name=team_name,
+                recipient_email=recipient_email,
+                cases=team_cases,
+                stakeholder_type="SUPPLY_TEAM",
+            )
+
+            emails.append(email)
+
+    # -----------------------------
+    # AIR → CFO
+    # -----------------------------
+
+    air_cases = actions[
+        actions["Transport Mode"].astype(str).str.upper() == "AIR"
+    ].copy()
+
+    if not air_cases.empty:
+        email = generate_stakeholder_email(
+            recipient_name="CFO",
+            recipient_email="cfo@example.com",
+            cases=air_cases,
+            stakeholder_type="CFO",
+        )
+
+        emails.append(email)
+
+    return emails
 # ---------------------------------------------------------------------------
 # The endpoint Make.com calls.
 # ---------------------------------------------------------------------------
@@ -329,24 +606,53 @@ def run_pipeline():
 
         data = load_data()
         master = build_master(data)
+
         actions = build_procurement_actions(master)
+
         wc = build_working_capital(master)
+
         kpis = compute_kpis(master)
+
         summary = build_gemini_summary(actions, wc)
-        draft = build_email_draft(summary, actions)
+
+        # Output 1 -- the daily management one-pager (separate audience
+        # from the SEA/AIR procurement emails below).
+        onepager = build_health_onepager(kpis, summary)
+
+        # Generate separate stakeholder-specific emails
+        stakeholder_emails = build_stakeholder_emails(actions)
 
         return RunResponse(
             run_timestamp=run_timestamp,
+
             kpis=kpis,
-            top_procurement_actions=actions.head(15).replace({np.nan: None}).to_dict(orient="records"),
-            top_working_capital=wc.head(15).replace({np.nan: None}).to_dict(orient="records"),
+
+            top_procurement_actions=(
+                actions.head(15)
+                .replace({np.nan: None})
+                .to_dict(orient="records")
+            ),
+
+            top_working_capital=(
+                wc.head(15)
+                .replace({np.nan: None})
+                .to_dict(orient="records")
+            ),
+
             gemini_summary=summary,
-            email_subject=draft["subject"],
-            email_body=draft["body"],
+
+            health_onepager=onepager,
+
+            stakeholder_emails=stakeholder_emails,
+
             open_po_caveat=OPEN_PO_MATCH_CAVEAT,
         )
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
 
 @app.get("/health")
