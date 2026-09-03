@@ -39,7 +39,7 @@ app = FastAPI(title="Inventory Control Tower Pipeline")
 # ---------------------------------------------------------------------------
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 # Where the three source Excel files live -- included in the GitHub repo,
 # in a folder named "data". See README.md for why this repo needs to be
@@ -414,17 +414,7 @@ def generate_stakeholder_email(
     cases: pd.DataFrame,
     stakeholder_type: str,
 ) -> dict:
-    """
-    Generate a stakeholder-specific procurement email using Gemini.
-
-    Python determines:
-      - which SKUs need action
-      - SEA vs AIR
-      - which Supply Team owns each SEA case
-      - that AIR cases go to CFO
-
-    Gemini only turns those decisions into a professional email.
-    """
+    """Build a clean stakeholder email from Python-calculated facts."""
 
     if cases.empty:
         return {
@@ -435,112 +425,99 @@ def generate_stakeholder_email(
             "body": "",
         }
 
-    # Format the data before sending it to Gemini so we never get
-    # long floating-point values such as 252.33333333333007.
-    case_lines = []
+    def fmt_num(value):
+        try:
+            value = float(value)
+            if value.is_integer():
+                return f"{int(value):,}"
+            return f"{value:,.2f}".rstrip("0").rstrip(".")
+        except (TypeError, ValueError):
+            return str(value)
 
-    for _, row in cases.iterrows():
-        sap_code = str(row["SAP code"])
-        current_inventory = f"{float(row['Current Inventory']):,.2f}"
-        coverage = f"{float(row['Coverage_months']):.2f}"
-        order_qty = f"{float(row['Recommended Order Qty']):,.2f}"
-        risk = str(row["Risk Reason"])
-
-        case_lines.append(
-            f"- SAP Code: {sap_code} | "
-            f"Current Inventory: {current_inventory} | "
-            f"Coverage: {coverage} months | "
-            f"Recommended Order Qty: {order_qty} | "
-            f"Risk: {risk}"
-        )
-
-    cases_text = "\n".join(case_lines)
+    critical = cases[cases["Risk Reason"] == "Critical stock-out risk"]
+    other = cases[cases["Risk Reason"] != "Critical stock-out risk"]
 
     if stakeholder_type == "CFO":
-        instruction = """
-You are writing a concise approval email to the CFO.
+        subject = "Approval Required: Expedited AIR Procurement"
+        lines = [
+            f"Dear {recipient_name},",
+            "",
+            "Please review and approve the following AIR procurement requests.",
+            "These cases require expedited transport due to inventory risk and the potential for stock-outs.",
+            "",
+        ]
 
-These are AIR procurement cases identified because of inventory risk.
-The CFO's action is to review and approve the expedited procurement.
+        if not critical.empty:
+            lines.append("Critical / Immediate Action:")
+            for _, row in critical.iterrows():
+                lines.append(
+                    f"- SAP Code: {row['SAP code']} | "
+                    f"Recommended Order Qty: {fmt_num(row['Recommended Order Qty'])} | "
+                    f"Coverage: {fmt_num(row['Coverage_months'])} months"
+                )
+            lines.append("")
 
-The email must:
-- Clearly request approval for the AIR procurement.
-- Briefly explain that expedited AIR procurement is required because of inventory risk.
-- Include every SAP code and recommended order quantity provided.
-- Group the information clearly and make critical cases easy to identify.
-- NOT mention any Supply Team.
-- NOT mention SEA procurement.
-- NOT invent costs, savings, dates, vendors, or other information.
-- Sound like a real internal business email, not an AI-generated report.
-"""
+        if not other.empty:
+            lines.append("Other AIR Procurement Cases:")
+            for _, row in other.iterrows():
+                lines.append(
+                    f"- SAP Code: {row['SAP code']} | "
+                    f"Recommended Order Qty: {fmt_num(row['Recommended Order Qty'])} | "
+                    f"Risk: {row['Risk Reason']}"
+                )
+            lines.append("")
+
+        lines += [
+            "Please confirm your approval to proceed with the expedited procurement.",
+            "",
+            "Thanks,",
+            "Planning Team",
+        ]
 
     else:
-        instruction = """
-You are writing a concise procurement request email to the specific
-Supply Team receiving this email.
+        subject = f"Action Required: SEA Procurement – {recipient_name}"
+        lines = [
+            f"Dear {recipient_name},",
+            "",
+            "Please initiate procurement for the SEA cases assigned to your team.",
+            "Prompt action is required to maintain inventory availability.",
+            "",
+        ]
 
-The cases provided belong ONLY to this recipient's team.
+        if not critical.empty:
+            lines.append("Critical / Immediate Action:")
+            for _, row in critical.iterrows():
+                lines.append(
+                    f"- SAP Code: {row['SAP code']} | "
+                    f"Recommended Order Qty: {fmt_num(row['Recommended Order Qty'])} | "
+                    f"Coverage: {fmt_num(row['Coverage_months'])} months"
+                )
+            lines.append("")
 
-The email must:
-- Ask the team to initiate procurement for these cases.
-- Clearly indicate that prompt action is required.
-- Include every SAP code and recommended order quantity provided.
-- Clearly identify critical stock-out cases.
-- Keep the wording concise and practical.
-- NOT mention any other Supply Team.
-- NOT mention AIR procurement.
-- NOT invent costs, savings, dates, vendors, or other information.
-- Sound like a real internal business email, not an AI-generated report.
-"""
+        if not other.empty:
+            lines.append("Other Procurement Cases:")
+            for _, row in other.iterrows():
+                lines.append(
+                    f"- SAP Code: {row['SAP code']} | "
+                    f"Recommended Order Qty: {fmt_num(row['Recommended Order Qty'])} | "
+                    f"Risk: {row['Risk Reason']}"
+                )
+            lines.append("")
 
-    prompt = f"""
-{instruction}
-
-Recipient: {recipient_name}
-
-Procurement cases:
-
-{cases_text}
-
-Write the email with this structure:
-
-Greeting
-
-One short paragraph explaining the request.
-
-A clean list of the procurement cases. For each case, show:
-- SAP Code
-- Recommended Order Qty
-- Risk Reason
-
-A short closing asking the recipient to proceed and confirm once processed.
-
-Use exactly this signature:
-
-Thanks,
-Planning Team
-
-Keep the email professional, warm, concise, and easy to scan.
-
-Return ONLY valid JSON in this exact format:
-
-{{
-  "subject": "...",
-  "body": "..."
-}}
-"""
-
-    # Use the configured Gemini client/model.
-    email = gemini_json(prompt)
+        lines += [
+            "Please proceed with procurement and confirm once the request has been processed.",
+            "",
+            "Thanks,",
+            "Planning Team",
+        ]
 
     return {
         "recipient_name": recipient_name,
         "recipient_email": recipient_email,
         "stakeholder_type": stakeholder_type,
-        "subject": email["subject"],
-        "body": email["body"],
+        "subject": subject,
+        "body": "\n".join(lines),
     }
-
 
 def build_stakeholder_emails(actions: pd.DataFrame) -> list[dict]:
     """
