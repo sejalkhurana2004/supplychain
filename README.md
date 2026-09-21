@@ -1,7 +1,6 @@
 # Inventory Control Tower — GitHub + Render + Make.com + Looker Studio
 
-No Google Cloud Console anywhere in this setup. Every account you'll touch has a
-plain "sign in with Google" button, nothing more.
+
 
 **The shape of the whole thing:**
 Make.com wakes up on schedule → calls your Render URL → your service runs the
@@ -142,10 +141,4 @@ Console is not part of this setup anywhere.
 
 ---
 
-## One thing to actually check before trusting this
 
-Everything above proves the *automation* works. It does not fix the two open
-data issues from the pilot: the Open PO reconciliation gap (still returned as
-`open_po_caveat` in every response, on purpose) and the unused GRN
-validation. Automating a pipeline doesn't resolve open questions about its
-numbers — it just means those numbers now update on their own.
